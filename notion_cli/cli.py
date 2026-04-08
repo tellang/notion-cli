@@ -15,8 +15,14 @@ from notion_cli.formatters import extract_title, flatten_page
 app = typer.Typer(help="notion — Minimal Notion CLI for AI agents", add_completion=False)
 page_app = typer.Typer(help="Page operations")
 db_app = typer.Typer(help="Database operations")
+block_app = typer.Typer(help="Block operations")
+comment_app = typer.Typer(help="Comment operations")
+user_app = typer.Typer(help="User operations")
 app.add_typer(page_app, name="page")
 app.add_typer(db_app, name="db")
+app.add_typer(block_app, name="block")
+app.add_typer(comment_app, name="comment")
+app.add_typer(user_app, name="user")
 
 
 def _dump(obj: object) -> None:
@@ -139,6 +145,33 @@ def page_create(
 
 
 # ---------------------------------------------------------------------------
+# notion page update
+# ---------------------------------------------------------------------------
+
+@page_app.command("update")
+def page_update(
+    page_id: Annotated[str, typer.Argument(help="페이지 UUID")],
+    props_json: Annotated[Optional[str], typer.Option("--props-json", help="프로퍼티 JSON 문자열")] = None,
+    archive: Annotated[Optional[bool], typer.Option("--archive", help="아카이브 여부")] = None,
+    trash: Annotated[Optional[bool], typer.Option("--trash", help="휴지통 이동 여부")] = None,
+) -> None:
+    """페이지 프로퍼티를 수정합니다."""
+    client = get_client()
+    kwargs: dict = {"page_id": page_id}
+    if props_json:
+        kwargs["properties"] = json.loads(props_json)
+    if archive is not None:
+        kwargs["archived"] = archive
+    if trash is not None:
+        kwargs["in_trash"] = trash
+    try:
+        page = client.pages.update(**kwargs)
+    except APIResponseError as exc:
+        _handle_api_error(exc)
+    _dump(flatten_page(page))
+
+
+# ---------------------------------------------------------------------------
 # notion db query
 # ---------------------------------------------------------------------------
 
@@ -228,6 +261,248 @@ def db_schema(
     title = "".join(seg.get("plain_text", "") for seg in title_arr)
 
     _dump({"id": db.get("id", ""), "title": title, "properties": schema})
+
+
+# ---------------------------------------------------------------------------
+# notion block list
+# ---------------------------------------------------------------------------
+
+def _flatten_block(block: dict) -> dict:
+    """Flatten a Notion block object for JSON output."""
+    btype = block.get("type", "")
+    content = block.get(btype, {})
+    rich_text = content.get("rich_text", [])
+    text = "".join(seg.get("plain_text", "") for seg in rich_text) if rich_text else None
+
+    result: dict = {
+        "id": block.get("id", ""),
+        "type": btype,
+        "has_children": block.get("has_children", False),
+    }
+    if text is not None:
+        result["text"] = text
+
+    if btype == "to_do":
+        result["checked"] = content.get("checked", False)
+    elif btype in ("image", "file", "pdf", "video"):
+        file_obj = content.get("file") or content.get("external") or {}
+        result["url"] = file_obj.get("url", "")
+    elif btype == "bookmark":
+        result["url"] = content.get("url", "")
+    elif btype == "code":
+        result["language"] = content.get("language", "")
+
+    return result
+
+
+@block_app.command("list")
+def block_list(
+    block_id: Annotated[str, typer.Argument(help="블록 또는 페이지 UUID")],
+    limit: Annotated[int, typer.Option("--limit", "-n", help="최대 결과 수")] = 100,
+) -> None:
+    """블록의 자식 블록 목록을 출력합니다."""
+    client = get_client()
+
+    results = []
+    cursor: str | None = None
+    collected = 0
+
+    while collected < limit:
+        kwargs: dict = {"block_id": block_id, "page_size": min(limit - collected, 100)}
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        try:
+            response = client.blocks.children.list(**kwargs)
+        except APIResponseError as exc:
+            _handle_api_error(exc)
+        for block in response.get("results", []):
+            results.append(_flatten_block(block))
+            collected += 1
+            if collected >= limit:
+                break
+        if not response.get("has_more"):
+            break
+        cursor = response.get("next_cursor")
+
+    _dump(results)
+
+
+# ---------------------------------------------------------------------------
+# notion block append
+# ---------------------------------------------------------------------------
+
+@block_app.command("append")
+def block_append(
+    block_id: Annotated[str, typer.Argument(help="블록 또는 페이지 UUID")],
+    body: Annotated[Optional[str], typer.Option("--body", "-b", help="추가할 텍스트 (단락으로 분할)")] = None,
+    blocks_json: Annotated[Optional[str], typer.Option("--blocks-json", help="블록 배열 JSON 문자열")] = None,
+) -> None:
+    """블록에 자식 블록을 추가합니다."""
+    if not body and not blocks_json:
+        print('{"error": "--body 또는 --blocks-json 중 하나를 지정하세요."}', file=sys.stderr)
+        raise typer.Exit(code=1)
+
+    client = get_client()
+
+    children: list[dict]
+    if blocks_json:
+        children = json.loads(blocks_json)
+    else:
+        children = []
+        for paragraph in body.split("\n\n"):
+            if paragraph.strip():
+                children.append({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": paragraph.strip()}}]},
+                })
+
+    try:
+        response = client.blocks.children.append(block_id=block_id, children=children)
+    except APIResponseError as exc:
+        _handle_api_error(exc)
+    _dump([_flatten_block(b) for b in response.get("results", [])])
+
+
+# ---------------------------------------------------------------------------
+# notion block delete
+# ---------------------------------------------------------------------------
+
+@block_app.command("delete")
+def block_delete(
+    block_id: Annotated[str, typer.Argument(help="삭제할 블록 UUID")],
+) -> None:
+    """블록을 삭제합니다."""
+    client = get_client()
+    try:
+        block = client.blocks.delete(block_id=block_id)
+    except APIResponseError as exc:
+        _handle_api_error(exc)
+    _dump({"id": block.get("id", ""), "archived": block.get("archived", True)})
+
+
+# ---------------------------------------------------------------------------
+# notion block get
+# ---------------------------------------------------------------------------
+
+@block_app.command("get")
+def block_get(
+    block_id: Annotated[str, typer.Argument(help="블록 UUID")],
+) -> None:
+    """단일 블록을 조회합니다."""
+    client = get_client()
+    try:
+        block = client.blocks.retrieve(block_id=block_id)
+    except APIResponseError as exc:
+        _handle_api_error(exc)
+    _dump(_flatten_block(block))
+
+
+# ---------------------------------------------------------------------------
+# notion comment list
+# ---------------------------------------------------------------------------
+
+@comment_app.command("list")
+def comment_list(
+    block_id: Annotated[str, typer.Argument(help="페이지 또는 블록 UUID")],
+    limit: Annotated[int, typer.Option("--limit", "-n", help="최대 결과 수")] = 100,
+) -> None:
+    """페이지 또는 블록의 댓글 목록을 출력합니다."""
+    client = get_client()
+
+    results = []
+    cursor: str | None = None
+    collected = 0
+
+    while collected < limit:
+        kwargs: dict = {"block_id": block_id, "page_size": min(limit - collected, 100)}
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        try:
+            response = client.comments.list(**kwargs)
+        except APIResponseError as exc:
+            _handle_api_error(exc)
+        for comment in response.get("results", []):
+            rich_text = comment.get("rich_text", [])
+            text = "".join(seg.get("plain_text", "") for seg in rich_text)
+            results.append({
+                "id": comment.get("id", ""),
+                "text": text,
+                "created_by": comment.get("created_by", {}).get("id", ""),
+                "created_time": comment.get("created_time", ""),
+            })
+            collected += 1
+            if collected >= limit:
+                break
+        if not response.get("has_more"):
+            break
+        cursor = response.get("next_cursor")
+
+    _dump(results)
+
+
+# ---------------------------------------------------------------------------
+# notion comment create
+# ---------------------------------------------------------------------------
+
+@comment_app.command("create")
+def comment_create(
+    page_id: Annotated[str, typer.Option("--page-id", help="댓글을 달 페이지 UUID")],
+    body: Annotated[str, typer.Option("--body", "-b", help="댓글 본문")],
+) -> None:
+    """페이지에 댓글을 작성합니다."""
+    client = get_client()
+    try:
+        comment = client.comments.create(
+            parent={"page_id": page_id},
+            rich_text=[{"type": "text", "text": {"content": body}}],
+        )
+    except APIResponseError as exc:
+        _handle_api_error(exc)
+    _dump({"id": comment.get("id", ""), "created_time": comment.get("created_time", "")})
+
+
+# ---------------------------------------------------------------------------
+# notion user list / me
+# ---------------------------------------------------------------------------
+
+@user_app.command("list")
+def user_list(
+    limit: Annotated[int, typer.Option("--limit", "-n", help="최대 결과 수")] = 100,
+) -> None:
+    """워크스페이스 사용자 목록을 출력합니다."""
+    client = get_client()
+    try:
+        response = client.users.list(page_size=min(limit, 100))
+    except APIResponseError as exc:
+        _handle_api_error(exc)
+
+    results = []
+    for user in response.get("results", [])[:limit]:
+        results.append({
+            "id": user.get("id", ""),
+            "type": user.get("type", ""),
+            "name": user.get("name", ""),
+            "avatar_url": user.get("avatar_url"),
+        })
+    _dump(results)
+
+
+@user_app.command("me")
+def user_me() -> None:
+    """현재 Integration(봇) 사용자 정보를 출력합니다."""
+    client = get_client()
+    try:
+        me = client.users.me()
+    except APIResponseError as exc:
+        _handle_api_error(exc)
+    _dump({
+        "id": me.get("id", ""),
+        "type": me.get("type", ""),
+        "name": me.get("name", ""),
+        "avatar_url": me.get("avatar_url"),
+        "bot": me.get("bot", {}),
+    })
 
 
 if __name__ == "__main__":
