@@ -1,4 +1,4 @@
-"""Typer CLI entry-point for notion-cli."""
+"""Typer CLI entry-point for notion-cli — Agent DX 7 principles applied."""
 
 from __future__ import annotations
 
@@ -11,8 +11,12 @@ from notion_client.errors import APIResponseError
 
 from notion_cli.client import get_client
 from notion_cli.formatters import extract_title, flatten_page
+from notion_cli.lib.fields import apply_fields
+from notion_cli.lib.output import output, output_error
+from notion_cli.lib.validate import ValidationError, validate_json_input, validate_notion_id
+from notion_cli.schemas import SCHEMAS
 
-app = typer.Typer(help="notion — Minimal Notion CLI for AI agents", add_completion=False)
+app = typer.Typer(help="notion — Notion API CLI for AI agents", add_completion=False)
 page_app = typer.Typer(help="Page operations")
 db_app = typer.Typer(help="Database operations")
 block_app = typer.Typer(help="Block operations")
@@ -25,14 +29,46 @@ app.add_typer(comment_app, name="comment")
 app.add_typer(user_app, name="user")
 
 
-def _dump(obj: object) -> None:
-    json.dump(obj, sys.stdout, ensure_ascii=False, indent=2)
-    print()
-
-
 def _handle_api_error(exc: APIResponseError) -> None:
-    _dump({"error": exc.code, "status": exc.status, "message": str(exc)})
+    output_error(exc.code, str(exc))
     raise typer.Exit(code=1)
+
+
+def _handle_validation_error(exc: ValidationError) -> None:
+    output_error(exc.code, str(exc))
+    raise typer.Exit(code=1)
+
+
+def _build_paragraphs(text: str) -> list[dict]:
+    children: list[dict] = []
+    for paragraph in text.split("\n\n"):
+        if paragraph.strip():
+            children.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": paragraph.strip()}}]},
+            })
+    return children
+
+
+# ---------------------------------------------------------------------------
+# notion schema — Runtime Schema Introspection (Principle 3)
+# ---------------------------------------------------------------------------
+
+@app.command()
+def schema(
+    command: Annotated[Optional[str], typer.Argument(help="커맨드 이름 (예: 'page get', 'db query')")] = None,
+) -> None:
+    """커맨드별 파라미터 스키마를 JSON으로 반환합니다."""
+    if not command:
+        commands = [{"command": k, "description": v["description"]} for k, v in SCHEMAS.items()]
+        output(commands)
+        return
+    s = SCHEMAS.get(command)
+    if not s:
+        output_error("NOT_FOUND", f"Unknown command: {command}")
+        raise typer.Exit(code=1)
+    output(s)
 
 
 # ---------------------------------------------------------------------------
@@ -41,11 +77,12 @@ def _handle_api_error(exc: APIResponseError) -> None:
 
 @app.command()
 def search(
-    query: Annotated[str, typer.Argument(help="검색 키워드")],
-    type: Annotated[Optional[str], typer.Option("--type", "-t", help="page 또는 db")] = None,
-    limit: Annotated[int, typer.Option("--limit", "-n", help="최대 결과 수")] = 20,
+    query: Annotated[str, typer.Argument(help="Search keyword")],
+    type: Annotated[Optional[str], typer.Option("--type", "-t", help="page or db")] = None,
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Max results")] = 20,
+    fields: Annotated[Optional[str], typer.Option("--fields", help="Comma-separated fields")] = None,
 ) -> None:
-    """워크스페이스에서 페이지/데이터베이스를 검색합니다."""
+    """Search workspace for pages and databases."""
     client = get_client()
 
     kwargs: dict = {"query": query, "page_size": min(limit, 100)}
@@ -57,6 +94,7 @@ def search(
         response = client.search(**kwargs)
     except APIResponseError as exc:
         _handle_api_error(exc)
+
     results = []
     for item in response.get("results", [])[:limit]:
         obj_type = item.get("object", "")
@@ -75,7 +113,7 @@ def search(
             "url": item.get("url", ""),
         })
 
-    _dump(results)
+    output(apply_fields(results, fields))
 
 
 # ---------------------------------------------------------------------------
@@ -84,17 +122,24 @@ def search(
 
 @page_app.command("get")
 def page_get(
-    page_id: Annotated[str, typer.Argument(help="페이지 UUID")],
-    props: Annotated[Optional[str], typer.Option("--props", "-p", help="쉼표 구분 프로퍼티 이름")] = None,
+    page_id: Annotated[str, typer.Argument(help="Page UUID")],
+    props: Annotated[Optional[str], typer.Option("--props", "-p", help="Comma-separated property names")] = None,
+    fields: Annotated[Optional[str], typer.Option("--fields", help="Comma-separated output fields")] = None,
 ) -> None:
-    """페이지 프로퍼티를 JSON으로 출력합니다."""
+    """Retrieve page properties as JSON."""
+    try:
+        validate_notion_id(page_id)
+    except ValidationError as exc:
+        _handle_validation_error(exc)
+
     client = get_client()
     try:
         page = client.pages.retrieve(page_id=page_id)
     except APIResponseError as exc:
         _handle_api_error(exc)
+
     props_filter = [p.strip() for p in props.split(",")] if props else None
-    _dump(flatten_page(page, props_filter))
+    output(apply_fields(flatten_page(page, props_filter), fields))
 
 
 # ---------------------------------------------------------------------------
@@ -103,18 +148,18 @@ def page_get(
 
 @page_app.command("create")
 def page_create(
-    title: Annotated[str, typer.Option("--title", "-t", help="페이지 제목")],
-    parent_page: Annotated[Optional[str], typer.Option("--parent-page", help="부모 페이지 UUID")] = None,
-    parent_db: Annotated[Optional[str], typer.Option("--parent-db", help="부모 데이터베이스 UUID")] = None,
-    body: Annotated[Optional[str], typer.Option("--body", "-b", help="본문 텍스트 (단락)")] = None,
-    props_json: Annotated[Optional[str], typer.Option("--props-json", help="추가 프로퍼티 JSON 문자열")] = None,
+    title: Annotated[str, typer.Option("--title", "-t", help="Page title")],
+    parent_page: Annotated[Optional[str], typer.Option("--parent-page", help="Parent page UUID")] = None,
+    parent_db: Annotated[Optional[str], typer.Option("--parent-db", help="Parent database UUID")] = None,
+    body: Annotated[Optional[str], typer.Option("--body", "-b", help="Body text (paragraphs)")] = None,
+    props_json: Annotated[Optional[str], typer.Option("--props-json", help="Additional properties JSON")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Preview without executing")] = False,
+    fields: Annotated[Optional[str], typer.Option("--fields", help="Comma-separated output fields")] = None,
 ) -> None:
-    """새 페이지를 생성합니다."""
+    """Create a new page."""
     if not parent_page and not parent_db:
-        print('{"error": "--parent-page 또는 --parent-db 중 하나를 지정하세요."}', file=sys.stderr)
+        output_error("MISSING_PARAM", "--parent-page or --parent-db required")
         raise typer.Exit(code=1)
-
-    client = get_client()
 
     parent: dict
     if parent_db:
@@ -124,24 +169,23 @@ def page_create(
 
     properties: dict = {"title": {"title": [{"text": {"content": title}}]}}
     if props_json:
-        extra = json.loads(props_json)
-        properties.update(extra)
+        try:
+            properties.update(validate_json_input(props_json))
+        except ValidationError as exc:
+            _handle_validation_error(exc)
 
-    children: list[dict] = []
-    if body:
-        for paragraph in body.split("\n\n"):
-            if paragraph.strip():
-                children.append({
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": paragraph.strip()}}]},
-                })
+    children = _build_paragraphs(body) if body else []
 
+    if dry_run:
+        output({"dryRun": True, "action": "pages.create", "parent": parent, "properties": properties, "children_count": len(children)})
+        return
+
+    client = get_client()
     try:
         response = client.pages.create(parent=parent, properties=properties, children=children or None)
     except APIResponseError as exc:
         _handle_api_error(exc)
-    _dump({"id": response.get("id", ""), "url": response.get("url", "")})
+    output(apply_fields({"id": response.get("id", ""), "url": response.get("url", "")}, fields))
 
 
 # ---------------------------------------------------------------------------
@@ -150,25 +194,40 @@ def page_create(
 
 @page_app.command("update")
 def page_update(
-    page_id: Annotated[str, typer.Argument(help="페이지 UUID")],
-    props_json: Annotated[Optional[str], typer.Option("--props-json", help="프로퍼티 JSON 문자열")] = None,
-    archive: Annotated[Optional[bool], typer.Option("--archive", help="아카이브 여부")] = None,
-    trash: Annotated[Optional[bool], typer.Option("--trash", help="휴지통 이동 여부")] = None,
+    page_id: Annotated[str, typer.Argument(help="Page UUID")],
+    props_json: Annotated[Optional[str], typer.Option("--props-json", help="Properties JSON")] = None,
+    archive: Annotated[Optional[bool], typer.Option("--archive", help="Archive")] = None,
+    trash: Annotated[Optional[bool], typer.Option("--trash", help="Move to trash")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Preview without executing")] = False,
+    fields: Annotated[Optional[str], typer.Option("--fields", help="Comma-separated output fields")] = None,
 ) -> None:
-    """페이지 프로퍼티를 수정합니다."""
-    client = get_client()
+    """Update page properties."""
+    try:
+        validate_notion_id(page_id)
+    except ValidationError as exc:
+        _handle_validation_error(exc)
+
     kwargs: dict = {"page_id": page_id}
     if props_json:
-        kwargs["properties"] = json.loads(props_json)
+        try:
+            kwargs["properties"] = validate_json_input(props_json)
+        except ValidationError as exc:
+            _handle_validation_error(exc)
     if archive is not None:
         kwargs["archived"] = archive
     if trash is not None:
         kwargs["in_trash"] = trash
+
+    if dry_run:
+        output({"dryRun": True, "action": "pages.update", **kwargs})
+        return
+
+    client = get_client()
     try:
         page = client.pages.update(**kwargs)
     except APIResponseError as exc:
         _handle_api_error(exc)
-    _dump(flatten_page(page))
+    output(apply_fields(flatten_page(page), fields))
 
 
 # ---------------------------------------------------------------------------
@@ -177,19 +236,28 @@ def page_update(
 
 @db_app.command("query")
 def db_query(
-    database_id: Annotated[str, typer.Argument(help="데이터베이스 또는 data_source UUID")],
-    filter: Annotated[Optional[str], typer.Option("--filter", "-f", help="필터 JSON 문자열")] = None,
-    sort: Annotated[Optional[str], typer.Option("--sort", "-s", help="정렬 (property:direction, 예: Date:descending)")] = None,
-    limit: Annotated[int, typer.Option("--limit", "-n", help="최대 결과 수")] = 100,
-    props: Annotated[Optional[str], typer.Option("--props", "-p", help="쉼표 구분 프로퍼티 이름")] = None,
+    database_id: Annotated[str, typer.Argument(help="Database or data_source UUID")],
+    filter: Annotated[Optional[str], typer.Option("--filter", "-f", help="Filter JSON")] = None,
+    sort: Annotated[Optional[str], typer.Option("--sort", "-s", help="Sort (property:direction)")] = None,
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Max results")] = 100,
+    props: Annotated[Optional[str], typer.Option("--props", "-p", help="Comma-separated property names")] = None,
+    fields: Annotated[Optional[str], typer.Option("--fields", help="Comma-separated output fields")] = None,
 ) -> None:
-    """데이터베이스를 쿼리하고 결과를 JSON으로 출력합니다."""
+    """Query a database and return results as JSON."""
+    try:
+        validate_notion_id(database_id)
+    except ValidationError as exc:
+        _handle_validation_error(exc)
+
     client = get_client()
 
     kwargs: dict = {"data_source_id": database_id, "page_size": min(limit, 100)}
 
     if filter:
-        kwargs["filter"] = json.loads(filter)
+        try:
+            kwargs["filter"] = validate_json_input(filter)
+        except ValidationError as exc:
+            _handle_validation_error(exc)
 
     if sort:
         sorts = []
@@ -225,7 +293,7 @@ def db_query(
             break
         cursor = response.get("next_cursor")
 
-    _dump(results)
+    output(apply_fields(results, fields))
 
 
 # ---------------------------------------------------------------------------
@@ -234,9 +302,14 @@ def db_query(
 
 @db_app.command("schema")
 def db_schema(
-    database_id: Annotated[str, typer.Argument(help="데이터베이스 또는 data_source UUID")],
+    database_id: Annotated[str, typer.Argument(help="Database or data_source UUID")],
 ) -> None:
-    """데이터베이스 스키마(프로퍼티 정의)를 JSON으로 출력합니다."""
+    """Retrieve database schema (property definitions)."""
+    try:
+        validate_notion_id(database_id)
+    except ValidationError as exc:
+        _handle_validation_error(exc)
+
     client = get_client()
     try:
         db = client.data_sources.retrieve(data_source_id=database_id)
@@ -246,7 +319,7 @@ def db_schema(
         except APIResponseError as exc:
             _handle_api_error(exc)
 
-    schema = {}
+    props_schema = {}
     for name, prop in db.get("properties", {}).items():
         entry: dict = {"type": prop.get("type", "")}
         if prop.get("type") == "select":
@@ -255,20 +328,19 @@ def db_schema(
             entry["options"] = [opt["name"] for opt in prop.get("multi_select", {}).get("options", [])]
         elif prop.get("type") == "status":
             entry["options"] = [opt["name"] for opt in prop.get("status", {}).get("options", [])]
-        schema[name] = entry
+        props_schema[name] = entry
 
     title_arr = db.get("title", [])
     title = "".join(seg.get("plain_text", "") for seg in title_arr)
 
-    _dump({"id": db.get("id", ""), "title": title, "properties": schema})
+    output({"id": db.get("id", ""), "title": title, "properties": props_schema})
 
 
 # ---------------------------------------------------------------------------
-# notion block list
+# Block helpers
 # ---------------------------------------------------------------------------
 
 def _flatten_block(block: dict) -> dict:
-    """Flatten a Notion block object for JSON output."""
     btype = block.get("type", "")
     content = block.get(btype, {})
     rich_text = content.get("rich_text", [])
@@ -295,14 +367,23 @@ def _flatten_block(block: dict) -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# notion block list
+# ---------------------------------------------------------------------------
+
 @block_app.command("list")
 def block_list(
-    block_id: Annotated[str, typer.Argument(help="블록 또는 페이지 UUID")],
-    limit: Annotated[int, typer.Option("--limit", "-n", help="최대 결과 수")] = 100,
+    block_id: Annotated[str, typer.Argument(help="Block or page UUID")],
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Max results")] = 100,
+    fields: Annotated[Optional[str], typer.Option("--fields", help="Comma-separated output fields")] = None,
 ) -> None:
-    """블록의 자식 블록 목록을 출력합니다."""
-    client = get_client()
+    """List child blocks."""
+    try:
+        validate_notion_id(block_id)
+    except ValidationError as exc:
+        _handle_validation_error(exc)
 
+    client = get_client()
     results = []
     cursor: str | None = None
     collected = 0
@@ -324,61 +405,7 @@ def block_list(
             break
         cursor = response.get("next_cursor")
 
-    _dump(results)
-
-
-# ---------------------------------------------------------------------------
-# notion block append
-# ---------------------------------------------------------------------------
-
-@block_app.command("append")
-def block_append(
-    block_id: Annotated[str, typer.Argument(help="블록 또는 페이지 UUID")],
-    body: Annotated[Optional[str], typer.Option("--body", "-b", help="추가할 텍스트 (단락으로 분할)")] = None,
-    blocks_json: Annotated[Optional[str], typer.Option("--blocks-json", help="블록 배열 JSON 문자열")] = None,
-) -> None:
-    """블록에 자식 블록을 추가합니다."""
-    if not body and not blocks_json:
-        print('{"error": "--body 또는 --blocks-json 중 하나를 지정하세요."}', file=sys.stderr)
-        raise typer.Exit(code=1)
-
-    client = get_client()
-
-    children: list[dict]
-    if blocks_json:
-        children = json.loads(blocks_json)
-    else:
-        children = []
-        for paragraph in body.split("\n\n"):
-            if paragraph.strip():
-                children.append({
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": paragraph.strip()}}]},
-                })
-
-    try:
-        response = client.blocks.children.append(block_id=block_id, children=children)
-    except APIResponseError as exc:
-        _handle_api_error(exc)
-    _dump([_flatten_block(b) for b in response.get("results", [])])
-
-
-# ---------------------------------------------------------------------------
-# notion block delete
-# ---------------------------------------------------------------------------
-
-@block_app.command("delete")
-def block_delete(
-    block_id: Annotated[str, typer.Argument(help="삭제할 블록 UUID")],
-) -> None:
-    """블록을 삭제합니다."""
-    client = get_client()
-    try:
-        block = client.blocks.delete(block_id=block_id)
-    except APIResponseError as exc:
-        _handle_api_error(exc)
-    _dump({"id": block.get("id", ""), "archived": block.get("archived", True)})
+    output(apply_fields(results, fields))
 
 
 # ---------------------------------------------------------------------------
@@ -387,15 +414,89 @@ def block_delete(
 
 @block_app.command("get")
 def block_get(
-    block_id: Annotated[str, typer.Argument(help="블록 UUID")],
+    block_id: Annotated[str, typer.Argument(help="Block UUID")],
 ) -> None:
-    """단일 블록을 조회합니다."""
+    """Retrieve a single block."""
+    try:
+        validate_notion_id(block_id)
+    except ValidationError as exc:
+        _handle_validation_error(exc)
+
     client = get_client()
     try:
         block = client.blocks.retrieve(block_id=block_id)
     except APIResponseError as exc:
         _handle_api_error(exc)
-    _dump(_flatten_block(block))
+    output(_flatten_block(block))
+
+
+# ---------------------------------------------------------------------------
+# notion block append
+# ---------------------------------------------------------------------------
+
+@block_app.command("append")
+def block_append(
+    block_id: Annotated[str, typer.Argument(help="Block or page UUID")],
+    body: Annotated[Optional[str], typer.Option("--body", "-b", help="Text to append")] = None,
+    blocks_json: Annotated[Optional[str], typer.Option("--blocks-json", help="Block array JSON")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Preview without executing")] = False,
+) -> None:
+    """Append child blocks."""
+    if not body and not blocks_json:
+        output_error("MISSING_PARAM", "--body or --blocks-json required")
+        raise typer.Exit(code=1)
+
+    try:
+        validate_notion_id(block_id)
+    except ValidationError as exc:
+        _handle_validation_error(exc)
+
+    children: list[dict]
+    if blocks_json:
+        try:
+            children = validate_json_input(blocks_json)
+        except ValidationError as exc:
+            _handle_validation_error(exc)
+    else:
+        children = _build_paragraphs(body)
+
+    if dry_run:
+        output({"dryRun": True, "action": "blocks.children.append", "block_id": block_id, "children_count": len(children), "children": children})
+        return
+
+    client = get_client()
+    try:
+        response = client.blocks.children.append(block_id=block_id, children=children)
+    except APIResponseError as exc:
+        _handle_api_error(exc)
+    output([_flatten_block(b) for b in response.get("results", [])])
+
+
+# ---------------------------------------------------------------------------
+# notion block delete
+# ---------------------------------------------------------------------------
+
+@block_app.command("delete")
+def block_delete(
+    block_id: Annotated[str, typer.Argument(help="Block UUID")],
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Preview without executing")] = False,
+) -> None:
+    """Delete a block."""
+    try:
+        validate_notion_id(block_id)
+    except ValidationError as exc:
+        _handle_validation_error(exc)
+
+    if dry_run:
+        output({"dryRun": True, "action": "blocks.delete", "block_id": block_id})
+        return
+
+    client = get_client()
+    try:
+        block = client.blocks.delete(block_id=block_id)
+    except APIResponseError as exc:
+        _handle_api_error(exc)
+    output({"id": block.get("id", ""), "archived": block.get("archived", True)})
 
 
 # ---------------------------------------------------------------------------
@@ -404,12 +505,17 @@ def block_get(
 
 @comment_app.command("list")
 def comment_list(
-    block_id: Annotated[str, typer.Argument(help="페이지 또는 블록 UUID")],
-    limit: Annotated[int, typer.Option("--limit", "-n", help="최대 결과 수")] = 100,
+    block_id: Annotated[str, typer.Argument(help="Page or block UUID")],
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Max results")] = 100,
+    fields: Annotated[Optional[str], typer.Option("--fields", help="Comma-separated output fields")] = None,
 ) -> None:
-    """페이지 또는 블록의 댓글 목록을 출력합니다."""
-    client = get_client()
+    """List comments on a page or block."""
+    try:
+        validate_notion_id(block_id)
+    except ValidationError as exc:
+        _handle_validation_error(exc)
 
+    client = get_client()
     results = []
     cursor: str | None = None
     collected = 0
@@ -438,7 +544,7 @@ def comment_list(
             break
         cursor = response.get("next_cursor")
 
-    _dump(results)
+    output(apply_fields(results, fields))
 
 
 # ---------------------------------------------------------------------------
@@ -447,10 +553,20 @@ def comment_list(
 
 @comment_app.command("create")
 def comment_create(
-    page_id: Annotated[str, typer.Option("--page-id", help="댓글을 달 페이지 UUID")],
-    body: Annotated[str, typer.Option("--body", "-b", help="댓글 본문")],
+    page_id: Annotated[str, typer.Option("--page-id", help="Page UUID")],
+    body: Annotated[str, typer.Option("--body", "-b", help="Comment text")],
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Preview without executing")] = False,
 ) -> None:
-    """페이지에 댓글을 작성합니다."""
+    """Create a comment on a page."""
+    try:
+        validate_notion_id(page_id)
+    except ValidationError as exc:
+        _handle_validation_error(exc)
+
+    if dry_run:
+        output({"dryRun": True, "action": "comments.create", "parent": {"page_id": page_id}, "body": body})
+        return
+
     client = get_client()
     try:
         comment = client.comments.create(
@@ -459,7 +575,7 @@ def comment_create(
         )
     except APIResponseError as exc:
         _handle_api_error(exc)
-    _dump({"id": comment.get("id", ""), "created_time": comment.get("created_time", "")})
+    output({"id": comment.get("id", ""), "created_time": comment.get("created_time", "")})
 
 
 # ---------------------------------------------------------------------------
@@ -468,9 +584,10 @@ def comment_create(
 
 @user_app.command("list")
 def user_list(
-    limit: Annotated[int, typer.Option("--limit", "-n", help="최대 결과 수")] = 100,
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Max results")] = 100,
+    fields: Annotated[Optional[str], typer.Option("--fields", help="Comma-separated output fields")] = None,
 ) -> None:
-    """워크스페이스 사용자 목록을 출력합니다."""
+    """List workspace users."""
     client = get_client()
     try:
         response = client.users.list(page_size=min(limit, 100))
@@ -485,18 +602,18 @@ def user_list(
             "name": user.get("name", ""),
             "avatar_url": user.get("avatar_url"),
         })
-    _dump(results)
+    output(apply_fields(results, fields))
 
 
 @user_app.command("me")
 def user_me() -> None:
-    """현재 Integration(봇) 사용자 정보를 출력합니다."""
+    """Get current integration (bot) user info."""
     client = get_client()
     try:
         me = client.users.me()
     except APIResponseError as exc:
         _handle_api_error(exc)
-    _dump({
+    output({
         "id": me.get("id", ""),
         "type": me.get("type", ""),
         "name": me.get("name", ""),
