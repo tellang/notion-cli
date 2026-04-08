@@ -5,7 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "notion-cli"
 version = "0.1.0"
-description = "Minimal Notion CLI for AI agent consumption"
+description = "Notion API CLI — JSON output for AI agents and scripts"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "notion-client>=3.0.0",
