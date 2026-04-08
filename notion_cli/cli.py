@@ -7,6 +7,7 @@ import sys
 from typing import Annotated, Optional
 
 import typer
+from notion_client.errors import APIResponseError
 
 from notion_cli.client import get_client
 from notion_cli.formatters import extract_title, flatten_page
@@ -21,6 +22,11 @@ app.add_typer(db_app, name="db")
 def _dump(obj: object) -> None:
     json.dump(obj, sys.stdout, ensure_ascii=False, indent=2)
     print()
+
+
+def _handle_api_error(exc: APIResponseError) -> None:
+    _dump({"error": exc.code, "status": exc.status, "message": str(exc)})
+    raise typer.Exit(code=1)
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +47,10 @@ def search(
         value = "data_source" if type in ("db", "database") else "page"
         kwargs["filter"] = {"property": "object", "value": value}
 
-    response = client.search(**kwargs)
+    try:
+        response = client.search(**kwargs)
+    except APIResponseError as exc:
+        _handle_api_error(exc)
     results = []
     for item in response.get("results", [])[:limit]:
         obj_type = item.get("object", "")
@@ -74,7 +83,10 @@ def page_get(
 ) -> None:
     """페이지 프로퍼티를 JSON으로 출력합니다."""
     client = get_client()
-    page = client.pages.retrieve(page_id=page_id)
+    try:
+        page = client.pages.retrieve(page_id=page_id)
+    except APIResponseError as exc:
+        _handle_api_error(exc)
     props_filter = [p.strip() for p in props.split(",")] if props else None
     _dump(flatten_page(page, props_filter))
 
@@ -119,7 +131,10 @@ def page_create(
                     "paragraph": {"rich_text": [{"type": "text", "text": {"content": paragraph.strip()}}]},
                 })
 
-    response = client.pages.create(parent=parent, properties=properties, children=children or None)
+    try:
+        response = client.pages.create(parent=parent, properties=properties, children=children or None)
+    except APIResponseError as exc:
+        _handle_api_error(exc)
     _dump({"id": response.get("id", ""), "url": response.get("url", "")})
 
 
@@ -163,7 +178,10 @@ def db_query(
             kwargs["start_cursor"] = cursor
         kwargs["page_size"] = min(limit - collected, 100)
 
-        response = client.databases.query(**kwargs)
+        try:
+            response = client.databases.query(**kwargs)
+        except APIResponseError as exc:
+            _handle_api_error(exc)
         for page in response.get("results", []):
             results.append(flatten_page(page, props_filter))
             collected += 1
@@ -187,7 +205,10 @@ def db_schema(
 ) -> None:
     """데이터베이스 스키마(프로퍼티 정의)를 JSON으로 출력합니다."""
     client = get_client()
-    db = client.databases.retrieve(database_id=database_id)
+    try:
+        db = client.databases.retrieve(database_id=database_id)
+    except APIResponseError as exc:
+        _handle_api_error(exc)
 
     schema = {}
     for name, prop in db.get("properties", {}).items():
