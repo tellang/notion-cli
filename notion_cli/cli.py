@@ -144,7 +144,7 @@ def page_create(
 
 @db_app.command("query")
 def db_query(
-    database_id: Annotated[str, typer.Argument(help="데이터베이스 UUID")],
+    database_id: Annotated[str, typer.Argument(help="데이터베이스 또는 data_source UUID")],
     filter: Annotated[Optional[str], typer.Option("--filter", "-f", help="필터 JSON 문자열")] = None,
     sort: Annotated[Optional[str], typer.Option("--sort", "-s", help="정렬 (property:direction, 예: Date:descending)")] = None,
     limit: Annotated[int, typer.Option("--limit", "-n", help="최대 결과 수")] = 100,
@@ -153,7 +153,7 @@ def db_query(
     """데이터베이스를 쿼리하고 결과를 JSON으로 출력합니다."""
     client = get_client()
 
-    kwargs: dict = {"database_id": database_id, "page_size": min(limit, 100)}
+    kwargs: dict = {"data_source_id": database_id, "page_size": min(limit, 100)}
 
     if filter:
         kwargs["filter"] = json.loads(filter)
@@ -179,7 +179,7 @@ def db_query(
         kwargs["page_size"] = min(limit - collected, 100)
 
         try:
-            response = client.databases.query(**kwargs)
+            response = client.data_sources.query(**kwargs)
         except APIResponseError as exc:
             _handle_api_error(exc)
         for page in response.get("results", []):
@@ -201,14 +201,17 @@ def db_query(
 
 @db_app.command("schema")
 def db_schema(
-    database_id: Annotated[str, typer.Argument(help="데이터베이스 UUID")],
+    database_id: Annotated[str, typer.Argument(help="데이터베이스 또는 data_source UUID")],
 ) -> None:
     """데이터베이스 스키마(프로퍼티 정의)를 JSON으로 출력합니다."""
     client = get_client()
     try:
-        db = client.databases.retrieve(database_id=database_id)
-    except APIResponseError as exc:
-        _handle_api_error(exc)
+        db = client.data_sources.retrieve(data_source_id=database_id)
+    except APIResponseError:
+        try:
+            db = client.databases.retrieve(database_id=database_id)
+        except APIResponseError as exc:
+            _handle_api_error(exc)
 
     schema = {}
     for name, prop in db.get("properties", {}).items():
